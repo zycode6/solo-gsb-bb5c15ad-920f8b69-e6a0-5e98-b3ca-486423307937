@@ -54,3 +54,20 @@ class PoolOverview(BaseModel):
     reservations: list[ReservationOut]
     active_leases: list[LeaseOut]
     free_cidrs: list[str]
+
+
+class AuditEventOut(BaseModel):
+    seq: int
+    action: str
+    lease_id: int
+    pool_id: int
+    cidr: str
+    occurred_at: int
+    details: dict
+    prev_hash: str
+    hash: str
+
+
+class AuditVerifyOut(BaseModel):
+    valid: bool
+    invalid_seq: int | None

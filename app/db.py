@@ -50,6 +50,20 @@ CREATE TABLE IF NOT EXISTS leases (
     renewed_at  INTEGER NOT NULL
 );
 
+-- Hash-chained audit log: one row per successful lease lifecycle event,
+-- appended inside the same BEGIN IMMEDIATE transaction as the change.
+CREATE TABLE IF NOT EXISTS audit_events (
+    seq         INTEGER PRIMARY KEY,  -- 1, 2, 3, ... assigned under the write lock
+    action      TEXT NOT NULL,        -- allocate | renew | release | expire
+    lease_id    INTEGER NOT NULL,
+    pool_id     INTEGER NOT NULL,
+    cidr        TEXT NOT NULL,
+    occurred_at INTEGER NOT NULL,
+    details     TEXT NOT NULL DEFAULT '{}',  -- canonical (sorted, compact) JSON object
+    prev_hash   TEXT NOT NULL,        -- previous event's hash; 64 zeros for the first
+    hash        TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_reservations_pool ON reservations(pool_id);
 CREATE INDEX IF NOT EXISTS idx_leases_pool_status ON leases(pool_id, status);
 CREATE INDEX IF NOT EXISTS idx_leases_token ON leases(token);

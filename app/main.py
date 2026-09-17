@@ -7,10 +7,12 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
-from . import service
+from . import audit, service
 from .db import connect, get_db, init_db, write_tx
 from .errors import ApiError
 from .schemas import (
+    AuditEventOut,
+    AuditVerifyOut,
     LeaseOut,
     LeaseRequest,
     PoolCreate,
@@ -123,3 +125,15 @@ def renew_lease(
 def release_lease(token: str, db: sqlite3.Connection = Depends(get_db)) -> dict:
     with write_tx(db):
         return service.release_lease(db, token)
+
+
+# ---------- audit chain ----------
+
+@app.get("/audit/events", response_model=list[AuditEventOut])
+def list_audit_events(db: sqlite3.Connection = Depends(get_db)) -> list[dict]:
+    return audit.list_events(db)
+
+
+@app.get("/audit/verify", response_model=AuditVerifyOut)
+def verify_audit_chain(db: sqlite3.Connection = Depends(get_db)) -> dict:
+    return audit.verify_chain(db)
