@@ -188,3 +188,132 @@ def test_concurrent_allocations_never_overlap(client):
     assert cidrs == {f"192.0.2.{i}/32" for i in range(8)}
     tokens = [r.json()["token"] for r in successes]
     assert len(set(tokens)) == 8
+
+
+# ---------- audit chain ----------
+
+def _audit_events(client):
+    r = client.get("/audit/events")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_audit_chain_records_lifecycle_in_order(client):
+    pid = _create_pool(client, cidr="10.0.0.0/30")
+    lease = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 31, "ttl_seconds": 3600}
+    ).json()
+    token = lease["token"]
+    client.post(f"/leases/{token}/renew", json={"ttl_seconds": 7200})
+    client.post(f"/leases/{token}/release")
+
+    events = _audit_events(client)
+    assert [e["action"] for e in events] == [
+        "allocated", "renewed", "released"
+    ]
+    assert [e["seq"] for e in events] == [1, 2, 3]
+    for e in events:
+        assert e["pool_id"] == pid
+        assert e["cidr"] == lease["cidr"]
+        assert e["lease_id"] == lease["id"]
+    assert events[0]["prev_hash"] == "0" * 64
+    assert events[0]["details"]["token"] == token
+    assert events[0]["details"]["ttl_seconds"] == 3600
+    assert events[1]["prev_hash"] == events[0]["hash"]
+    assert events[1]["details"]["ttl_seconds"] == 7200
+    assert events[1]["details"]["previous_expires_at"] == lease["expires_at"]
+    assert events[2]["prev_hash"] == events[1]["hash"]
+    for e in events:
+        assert len(e["hash"]) == 64 and len(e["prev_hash"]) == 64
+
+    assert client.get("/audit/verify").json() == {
+        "valid": True, "invalid_seq": None
+    }
+
+
+def test_audit_chain_failed_operation_records_nothing(client):
+    pid = _create_pool(client, cidr="10.0.0.0/30")
+    client.post(f"/pools/{pid}/leases", json={"prefix_len": 31})
+    client.post(f"/pools/{pid}/leases", json={"prefix_len": 31})
+
+    # Pool exhausted: failed allocation must not append an event.
+    r = client.post(f"/pools/{pid}/leases", json={"prefix_len": 31})
+    assert r.status_code == 409
+    events = _audit_events(client)
+    assert [e["action"] for e in events] == ["allocated", "allocated"]
+
+    # Operations on an unknown / already-released token fail and stay unlogged.
+    assert client.post("/leases/nope/renew", json={}).status_code == 404
+    events = _audit_events(client)
+    assert len(events) == 2
+
+    assert client.get("/audit/verify").json()["valid"] is True
+
+
+def test_audit_chain_records_expiry_reclamation(client):
+    pid = _create_pool(client, cidr="10.0.0.0/30")
+    token = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 31, "ttl_seconds": 1}
+    ).json()["token"]
+    time.sleep(1.2)
+
+    # A later allocation sweeps the expired lease within its own transaction;
+    # the expired event is appended in that same BEGIN IMMEDIATE.
+    client.post(f"/pools/{pid}/leases", json={"prefix_len": 31})
+
+    actions = [e["action"] for e in _audit_events(client)]
+    assert actions == ["allocated", "expired", "allocated"]
+    expired = next(e for e in _audit_events(client) if e["action"] == "expired")
+    assert expired["details"]["expires_at"] <= expired["timestamp"]
+    assert client.get("/audit/verify").json()["valid"] is True
+
+
+def test_audit_verify_detects_tampering_and_first_invalid_seq(client):
+    pid = _create_pool(client, cidr="10.0.0.0/30")
+    client.post(f"/pools/{pid}/leases", json={"prefix_len": 31})
+    token = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 31}
+    ).json()["token"]
+    client.post(f"/leases/{token}/release")
+    assert len(_audit_events(client)) == 3
+
+    # Tamper with the second event's CIDR without updating its hash.
+    db = connect()
+    try:
+        db.execute(
+            "BEGIN IMMEDIATE",
+        )
+        db.execute(
+            "UPDATE audit_events SET cidr = ? WHERE seq = ?",
+            ("10.0.0.254/32", 2),
+        )
+        db.execute("COMMIT")
+    finally:
+        db.close()
+
+    result = client.get("/audit/verify").json()
+    assert result["valid"] is False
+    assert result["invalid_seq"] == 2
+
+
+def test_audit_hashes_match_spec_formula(client):
+    import hashlib
+    import json
+
+    pid = _create_pool(client, cidr="10.0.0.0/30")
+    client.post(f"/pools/{pid}/leases", json={"prefix_len": 31})
+    client.post(f"/pools/{pid}/leases", json={"prefix_len": 31})
+
+    events = _audit_events(client)
+    prev = "0" * 64
+    for e in events:
+        payload = {
+            k: v for k, v in e.items() if k not in ("prev_hash", "hash")
+        }
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        expected = hashlib.sha256((prev + canonical).encode("utf-8")).hexdigest()
+        assert e["hash"] == expected
+        assert e["prev_hash"] == prev
+        prev = e["hash"]

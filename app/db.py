@@ -53,6 +53,19 @@ CREATE TABLE IF NOT EXISTS leases (
 CREATE INDEX IF NOT EXISTS idx_reservations_pool ON reservations(pool_id);
 CREATE INDEX IF NOT EXISTS idx_leases_pool_status ON leases(pool_id, status);
 CREATE INDEX IF NOT EXISTS idx_leases_token ON leases(token);
+
+-- Tamper-evident lease lifecycle audit chain (app/audit.py).
+CREATE TABLE IF NOT EXISTS audit_events (
+    seq         INTEGER PRIMARY KEY,
+    action      TEXT NOT NULL,            -- allocated | renewed | released | expired
+    lease_id    INTEGER NOT NULL REFERENCES leases(id),
+    pool_id     INTEGER NOT NULL REFERENCES pools(id),
+    cidr        TEXT NOT NULL,
+    timestamp   INTEGER NOT NULL,
+    details     TEXT NOT NULL DEFAULT '{}',  -- compact key-sorted JSON
+    prev_hash   TEXT NOT NULL,
+    hash        TEXT NOT NULL
+);
 """
 
 

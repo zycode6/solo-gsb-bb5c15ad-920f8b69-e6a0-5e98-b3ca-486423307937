@@ -4,6 +4,7 @@ import secrets
 import sqlite3
 import time
 
+from . import audit
 from .errors import ApiError
 from .iputil import (
     bounds,
@@ -75,13 +76,34 @@ def _reservation_occupancy(
 
 
 def _sweep_pool(conn: sqlite3.Connection, pool_id: int, now: int) -> int:
-    """Mark expired active leases as expired. Caller holds the tx lock."""
-    cur = conn.execute(
+    """Mark expired active leases as expired and audit each reclamation.
+
+    Caller holds the tx lock, so the expiry updates and the audit events
+    commit atomically.
+    """
+    expired = conn.execute(
+        "SELECT id, cidr, expires_at FROM leases "
+        "WHERE pool_id = ? AND status = 'active' AND expires_at <= ?",
+        (pool_id, now),
+    ).fetchall()
+    if not expired:
+        return 0
+    conn.execute(
         "UPDATE leases SET status = 'expired' "
         "WHERE pool_id = ? AND status = 'active' AND expires_at <= ?",
         (pool_id, now),
     )
-    return cur.rowcount
+    for lease in expired:
+        audit.append_event(
+            conn,
+            action="expired",
+            lease_id=lease["id"],
+            pool_id=pool_id,
+            cidr=lease["cidr"],
+            timestamp=now,
+            details={"expires_at": lease["expires_at"]},
+        )
+    return len(expired)
 
 
 # ---------- pools ----------
@@ -262,7 +284,22 @@ def allocate_lease(
         (pool_id, net_cidr, token, str(start), str(end), expires_at, now, now),
     )
     row = conn.execute("SELECT * FROM leases WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return _lease_row_to_dict(row)
+    result = _lease_row_to_dict(row)
+    audit.append_event(
+        conn,
+        action="allocated",
+        lease_id=result["id"],
+        pool_id=pool_id,
+        cidr=net_cidr,
+        timestamp=now,
+        details={
+            "token": token,
+            "prefix_len": prefix_len,
+            "ttl_seconds": ttl,
+            "expires_at": expires_at,
+        },
+    )
+    return result
 
 
 def renew_lease(
@@ -279,6 +316,7 @@ def renew_lease(
     _sweep_pool(conn, row["pool_id"], now)
     row = _find_lease(conn, token)
     _require_live(row, now)
+    previous_expires_at = row["expires_at"]
 
     expires_at = now + ttl
     conn.execute(
@@ -286,7 +324,22 @@ def renew_lease(
         (expires_at, now, row["id"]),
     )
     row = conn.execute("SELECT * FROM leases WHERE id = ?", (row["id"],)).fetchone()
-    return _lease_row_to_dict(row)
+    result = _lease_row_to_dict(row)
+    audit.append_event(
+        conn,
+        action="renewed",
+        lease_id=result["id"],
+        pool_id=result["pool_id"],
+        cidr=result["cidr"],
+        timestamp=now,
+        details={
+            "token": result["token"],
+            "ttl_seconds": ttl,
+            "previous_expires_at": previous_expires_at,
+            "expires_at": expires_at,
+        },
+    )
+    return result
 
 
 def release_lease(conn: sqlite3.Connection, token: str) -> dict:
@@ -300,7 +353,17 @@ def release_lease(conn: sqlite3.Connection, token: str) -> dict:
         "UPDATE leases SET status = 'released' WHERE id = ?", (row["id"],)
     )
     row = conn.execute("SELECT * FROM leases WHERE id = ?", (row["id"],)).fetchone()
-    return _lease_row_to_dict(row)
+    result = _lease_row_to_dict(row)
+    audit.append_event(
+        conn,
+        action="released",
+        lease_id=result["id"],
+        pool_id=result["pool_id"],
+        cidr=result["cidr"],
+        timestamp=now,
+        details={"token": result["token"], "expires_at": result["expires_at"]},
+    )
+    return result
 
 
 def get_lease(conn: sqlite3.Connection, token: str) -> dict:

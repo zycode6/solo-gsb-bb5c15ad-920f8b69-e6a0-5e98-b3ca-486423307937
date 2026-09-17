@@ -1,8 +1,8 @@
 # CIDR 地址租约 API
 
 基于 **Python + FastAPI + SQLite + 标准库 `ipaddress`** 的本地 CIDR 地址租约服务。
-支持 IPv4 / IPv6 地址池、保留网段、事务化租约分配、续租/释放、过期自动回收，以及
-空闲空间的最简 CIDR 集合查询。
+支持 IPv4 / IPv6 地址池、保留网段、事务化租约分配、续租/释放、过期自动回收、
+空闲空间的最简 CIDR 集合查询，以及租约生命周期的**防篡改哈希审计链**。
 
 ## 快速启动（单条命令）
 
@@ -35,7 +35,35 @@ docker compose up -d --build
 - 查询池详情返回活动租约、保留段，以及把所有空闲空间合并后的**最简 CIDR 集合**
   （相邻块合并、每段贪心取最大对齐块）。
 
+## 租约审计链
+
+租约的每次成功状态转移——**分配（`allocated`）、续租（`renewed`）、
+释放（`released`）、过期回收（`expired`）**——都会在执行该操作的同一个
+`BEGIN IMMEDIATE` 事务内向 `audit_events` 表追加一条事件。操作失败会整体回滚，
+**不会留下任何审计记录**。
+
+事件字段：
+
+| 字段 | 说明 |
+|---|---|
+| `seq` | 从 1 开始、严格递增且无空洞 |
+| `action` | `allocated` / `renewed` / `released` / `expired` |
+| `lease_id` / `pool_id` | 租约与地址池标识 |
+| `cidr` | 本次租约的网段 |
+| `timestamp` | Unix 秒级时间戳 |
+| `details` | 动作详情（如 `token`、`ttl_seconds`、`expires_at`、`previous_expires_at`） |
+| `prev_hash` | 上一条事件的 `hash`；首条为 64 个 `0` |
+| `hash` | 本条事件的 SHA-256 |
+
+`hash` 计算方式：把 `prev_hash` 文本，与**除 `prev_hash`、`hash` 外所有字段**
+按键名排序后的紧凑 JSON（UTF-8、无多余空格、递归排序，
+`json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`）
+直接拼接，取 SHA-256 十六进制摘要。任何字段被篡改、断链或缺号都可被
+`GET /audit/verify` 检出。
+
 ## API 一览
+
+所有接口均通过 `http://localhost:8000` 访问。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -49,6 +77,8 @@ docker compose up -d --build
 | GET | `/leases/{token}` | 查询单个租约 |
 | POST | `/leases/{token}/renew` | 续租 |
 | POST | `/leases/{token}/release` | 主动释放 |
+| GET | `/audit/events` | 按 `seq` 升序返回全部审计事件 |
+| GET | `/audit/verify` | 校验审计链，返回 `{"valid": bool, "invalid_seq": int\|null}` |
 
 状态码：成功 `200/201`；找不到资源 `404`；语义冲突（重叠、空间不足、
 令牌已失效）`409`；格式/边界/族不一致 `422`。
@@ -85,6 +115,14 @@ curl -s -X POST http://localhost:8000/leases/<TOKEN>/renew \
 
 # 6) 主动释放（网段立即回到空闲空间，旧令牌此后返回 409）
 curl -s -X POST http://localhost:8000/leases/<TOKEN>/release
+
+# 7) 查看审计链（按 seq 升序）并校验完整性
+curl -s http://localhost:8000/audit/events
+# [{"seq":1,"action":"allocated","lease_id":1,"pool_id":1,"cidr":"10.0.0.64/27",
+#   "timestamp":...,"details":{...},"prev_hash":"0000...0000","hash":"..."}, ...]
+
+curl -s http://localhost:8000/audit/verify
+# {"valid":true,"invalid_seq":null}
 ```
 
 IPv6 用法完全相同：
@@ -109,6 +147,9 @@ pytest -q
 测试覆盖：最小起始地址分配、空闲合并表示、保留段冲突、越界/族不一致/非规范拒绝、
 空间耗尽 409、续租、释放、TTL 过期回收、旧令牌 409、IPv6，以及 12 线程并发申请
 `/29` 池中 8 个 `/32`（恰好 8 个成功且互不重叠，其余 409）。
+审计链覆盖：四类动作（分配/续租/释放/过期回收）同事务落链且按序链接、
+失败操作不产生事件、哈希公式与防篡改校验（篡改字段后 `/audit/verify`
+返回首个 `invalid_seq`）。
 另已在 `uvicorn --workers 2` 多进程部署下验证 32 并发分配 `/24` 池中的 `/28`
 （16 个成功、块唯一且不重叠）。
 
@@ -118,8 +159,9 @@ pytest -q
 app/
   main.py      # FastAPI 路由与异常渲染
   service.py   # 业务逻辑（全部写操作在 BEGIN IMMEDIATE 事务内）
+  audit.py     # 租约审计链：SHA-256 哈希链、追加、查链、验链
   iputil.py    # ipaddress 封装：区间运算、最小起始分配、空闲合并
-  db.py        # SQLite 连接、WAL、schema
+  db.py        # SQLite 连接、WAL、schema（含 audit_events 表）
   schemas.py   # Pydantic 模型
   errors.py    # ApiError（404/409/422）
 tests/
@@ -136,4 +178,8 @@ requirements.txt
 - 选择最小合法 CIDR 时不枚举子网：空闲区间按起始地址排序，取第一个宽度足够的
   区间并向上对齐到所请求块大小，时间复杂度仅与占用记录数相关。
 - 过期判定为惰性：写操作在事务内把本池过期租约置为 `expired`；读接口若检测到
-  过期记录才取一次写锁，避免只读查询长期加锁。
+  过期记录才取一次写锁，避免只读查询长期加锁。无论哪条路径，状态更新与
+  `expired` 审计事件都在同一事务内提交。
+- 审计链只增不改：`seq` 为主键，`BEGIN IMMEDIATE` 串行化所有写者，
+  因此链尾读取、哈希计算与插入之间不存在并发缺口；哈希载荷采用递归键序、
+  紧凑分隔符的确定性 JSON，保证任意实现下复算结果一致。
